@@ -1,9 +1,7 @@
 ###############################################################################
-# BugTraceAI Apex G4-26B-Q4 — Kaggle Setup v6
-# FIXED vs v5:
-#   - Decorator syntax error (@app.get("/"); @app.get("/health")) removed
-#   - Duplicate LD_LIBRARY_PATH entries deduplicated
-#   - All single-line decorator shortcuts replaced with proper multi-line form
+# BugTraceAI Apex G4-26B-Q4 — Kaggle Setup FINAL (v6 + clean-output patch)
+# Single cell — run once, does everything: GPU fix, install, download,
+# server with thinking-channel stripped, warm-up, tunnel.
 ###############################################################################
 
 import subprocess, time, requests, os, sys, re, threading
@@ -27,7 +25,11 @@ def sh(cmd, capture=False):
 def banner(msg):
     print(f"\n{'='*60}\n  {msg}\n{'='*60}")
 
-banner("BugTraceAI Apex G4-26B-Q4 — Kaggle GPU Setup v6")
+banner("BugTraceAI Apex G4-26B-Q4 — Kaggle GPU Setup FINAL")
+
+# Kill any previously running server from an earlier cell run
+sh("pkill -f 'server.py' 2>/dev/null")
+time.sleep(1)
 
 # ─────────────────────────────────────────────────────────────
 # STEP 1 — GPU Check
@@ -77,7 +79,6 @@ if found_paths:
 else:
     print("    ⚠️  libcuda.so not found")
 
-# Build deduplicated LD_LIBRARY_PATH
 cuda_lib_dirs = [
     "/usr/local/nvidia/lib64",
     "/usr/local/cuda/lib64",
@@ -85,17 +86,14 @@ cuda_lib_dirs = [
     "/usr/local/lib",
     "/usr/lib/x86_64-linux-gnu",
 ]
-# Auto-detect versioned compat dirs
 for d in sh("find /usr/local -maxdepth 3 -name 'compat' -type d 2>/dev/null", capture=True).stdout.splitlines():
     d = d.strip()
     if d:
         cuda_lib_dirs.append(d)
 
-# Add libcuda source dir
 if libcuda_src:
     cuda_lib_dirs.insert(0, os.path.dirname(libcuda_src))
 
-# Deduplicate while preserving order, keep only dirs that exist
 seen = set()
 existing_dirs = []
 for d in cuda_lib_dirs:
@@ -161,25 +159,25 @@ model_path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE)
 print(f"✅  Model: {model_path}")
 
 # ─────────────────────────────────────────────────────────────
-# STEP 5 — Write server.py (no syntax shortcuts)
+# STEP 5 — Write server.py WITH clean-output patch baked in
 # ─────────────────────────────────────────────────────────────
-print("\n[5/8] Writing API server...")
+print("\n[5/8] Writing API server (with thinking-channel cleanup + warm-up)...")
 
 SERVER_SCRIPT = f'''#!/usr/bin/env python3
-"""BugTraceAI Apex v6 — Anthropic-Compatible API"""
+"""BugTraceAI Apex FINAL — Anthropic-Compatible API (clean output)"""
 import os
+import re
 import sys
 import time
 import subprocess
 
-# Set BEFORE any llama_cpp import
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["LD_LIBRARY_PATH"] = {repr(ld_path)}
 
 try:
     from llama_cpp import Llama
 except ModuleNotFoundError:
-    print("ERROR: llama_cpp not found — run the setup cell first")
+    print("ERROR: llama_cpp not found — run setup cell first")
     sys.exit(1)
 
 import uvicorn
@@ -191,6 +189,15 @@ from fastapi.responses import JSONResponse
 MODEL_PATH = {repr(model_path)}
 DEFAULT_SYSTEM = "You are BugTraceAI Apex, an expert offensive security assistant."
 
+# Strips leaked <|channel>thought ... <channel|> markers from raw-prompt generation
+THINKING_PATTERN = re.compile(
+    r"^\\s*<\\|channel>thought\\s*\\n?<channel\\|>\\s*", re.DOTALL
+)
+
+
+def clean_response(text: str) -> str:
+    return THINKING_PATTERN.sub("", text).strip()
+
 
 def get_vram():
     r = subprocess.run(
@@ -200,7 +207,7 @@ def get_vram():
     return [v.strip() for v in r.stdout.strip().splitlines() if v.strip()]
 
 
-print("\\n Loading model onto GPU...")
+print("\\nLoading model onto GPU...")
 vram_before = get_vram()
 print(f"   VRAM before load: {{vram_before}}")
 
@@ -216,10 +223,10 @@ for desc, kwargs in load_configs:
     try:
         print(f"   Trying: {{desc}}...")
         llm = Llama(model_path=MODEL_PATH, n_ctx=4096, verbose=False, **kwargs)
-        print(f"   Loaded successfully: {{desc}}")
+        print(f"   Loaded: {{desc}}")
         break
     except Exception as e:
-        print(f"   Failed ({{desc}}): {{e}}")
+        print(f"   Failed: {{e}}")
         llm = None
 
 if llm is None:
@@ -240,7 +247,16 @@ except Exception:
 gpu_status = "GPU" if total_gpu_mb > 2000 else "CPU"
 print(f"   Mode: {{gpu_status}} | VRAM delta: {{delta}} MiB ({{total_gpu_mb}} MiB total)")
 
-app = FastAPI(title="BugTraceAI API v6")
+# Warm-up call eats the one-time CUDA JIT compile cost so the first
+# real request (from Claude Code) is fast, not falsely flagged as CPU.
+print("   Running warm-up inference...")
+try:
+    _ = llm("<|turn>user\\nHi<turn|>\\n<|turn>model\\n", max_tokens=5)
+    print("   Warm-up complete.")
+except Exception as e:
+    print(f"   Warm-up skipped: {{e}}")
+
+app = FastAPI(title="BugTraceAI API FINAL")
 
 app.add_middleware(
     CORSMiddleware,
@@ -317,14 +333,15 @@ async def handle_messages(request: Request):
             content={{"error": {{"type": "server_error", "message": str(e)}}}},
         )
 
-    text = resp["choices"][0]["text"].strip()
+    raw_text = resp["choices"][0]["text"].strip()
+    text = clean_response(raw_text)
     usage = resp.get("usage", {{}})
 
     return {{
         "id": f"msg_{{int(time.time() * 1000)}}",
         "type": "message",
         "role": "assistant",
-        "model": req.get("model", "bugtraceai-apex-g4-26b-q4"),
+        "model": req.get("model", "claude-opus-4-5"),
         "content": [{{"type": "text", "text": text}}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
@@ -356,7 +373,6 @@ with open("/kaggle/working/server.py", "w") as f:
     f.write(SERVER_SCRIPT)
 print("✅  Server script written")
 
-# Quick syntax check before launching
 syntax = sh(f"{sys.executable} -m py_compile /kaggle/working/server.py", capture=True)
 if syntax.returncode == 0:
     print("✅  Syntax check passed")
@@ -365,9 +381,9 @@ else:
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────
-# STEP 6 — Launch server with full env
+# STEP 6 — Launch server (warm-up adds ~30s extra wait)
 # ─────────────────────────────────────────────────────────────
-print("\n[6/8] Launching server...")
+print("\n[6/8] Launching server (model load + warm-up, ~2.5-3 min)...")
 
 env = os.environ.copy()
 env["CUDA_VISIBLE_DEVICES"] = "0,1"
@@ -380,7 +396,7 @@ threading.Thread(target=_run_server, daemon=True).start()
 
 print("    Waiting for model to load", end="", flush=True)
 ready = False
-for _ in range(120):
+for _ in range(150):
     time.sleep(2)
     print(".", end="", flush=True)
     try:
@@ -405,7 +421,7 @@ except Exception:
     print("✅  Server UP!")
 
 # ─────────────────────────────────────────────────────────────
-# STEP 7 — Smoke test
+# STEP 7 — Smoke test (now post-warm-up, speed reading is accurate)
 # ─────────────────────────────────────────────────────────────
 print("\n[7/8] Smoke test...")
 try:
@@ -413,9 +429,9 @@ try:
     r = requests.post(
         "http://localhost:8000/v1/messages",
         json={
-            "model": "bugtraceai-apex",
-            "max_tokens": 20,
-            "messages": [{"role": "user", "content": "Say: OK"}],
+            "model": "claude-opus-4-5",
+            "max_tokens": 30,
+            "messages": [{"role": "user", "content": "Say: OK clean response"}],
         },
         headers={"x-api-key": "dummy", "anthropic-version": "2023-06-01"},
         timeout=90,
@@ -427,7 +443,7 @@ try:
         toks  = data["usage"]["output_tokens"]
         speed = toks / elapsed if elapsed > 0 else 0
         label = "GPU ✅" if speed > 15 else "CPU ⚠️ (slow but works)"
-        print(f"✅  '{text[:60]}' | {speed:.1f} tok/s → {label}")
+        print(f"✅  '{text[:80]}' | {speed:.1f} tok/s → {label}")
     else:
         print(f"❌  HTTP {r.status_code}: {r.text[:200]}")
 except Exception as e:
@@ -488,26 +504,27 @@ if not public_url:
 url = public_url or "http://localhost:8000 (local only)"
 print(f"""
 {'='*60}
-  BugTraceAI API LIVE
+  BugTraceAI API LIVE (clean output, warmed up)
 {'='*60}
   URL: {url}
 
-  Linux/macOS:
+  Linux/macOS — Claude Code CLI:
+    unset ANTHROPIC_AUTH_TOKEN
     export ANTHROPIC_API_KEY="dummy"
     export ANTHROPIC_BASE_URL="{url}"
-    claude
+    claude --bare --model claude-opus-4-5
 
   Windows PowerShell:
     $env:ANTHROPIC_API_KEY="dummy"
     $env:ANTHROPIC_BASE_URL="{url}"
-    claude
+    claude --bare --model claude-opus-4-5
 
   curl test:
     curl {url}/v1/messages \\
       -H "x-api-key: dummy" \\
       -H "anthropic-version: 2023-06-01" \\
       -H "content-type: application/json" \\
-      -d '{{"model":"bugtraceai-apex","max_tokens":50,"messages":[{{"role":"user","content":"Hello"}}]}}'
+      -d '{{"model":"claude-opus-4-5","max_tokens":50,"messages":[{{"role":"user","content":"Hello"}}]}}'
 {'='*60}
   Keep-alive running — do NOT close this tab.
 """)
